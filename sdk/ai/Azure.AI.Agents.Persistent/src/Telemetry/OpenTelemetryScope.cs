@@ -3,21 +3,21 @@
 
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
-using Azure.Core;
-using static Azure.AI.Agents.Persistent.Telemetry.OpenTelemetryConstants;
-using System.Threading.Tasks;
+using System.IO;
 using System.Linq;
-using System.Threading;
+using System.Net.Mail;
+using System.Reflection;
+using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.ClientModel.Primitives;
-using System.Net;
-using System.IO;
-using System.Text.Encodings.Web;
-using System.Text;
-using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Core;
+using static Azure.AI.Agents.Persistent.Telemetry.OpenTelemetryConstants;
 
 namespace Azure.AI.Agents.Persistent.Telemetry
 {
@@ -121,10 +121,13 @@ namespace Azure.AI.Agents.Persistent.Telemetry
             scope.SetTagMaybe(GenAiRequestTemperatureKey, createAgentRequest.Temperature);
             scope.SetTagMaybe(GenAiRequestTopPKey, createAgentRequest.TopP);
 
-            object evnt = s_traceContent ? new { content = createAgentRequest.Instructions } : "";
+            string evnt = s_traceContent ? JsonSerializer.Serialize(
+                new EventContent (createAgentRequest.Instructions),
+                EventsContext.Default.EventContent
+            ) : "";
             ActivityTagsCollection messageTags = new() {
                    { GenAiSystemKey, GenAiSystemValue},
-                   { GenAiEventContent, evnt != null ? JsonSerializer.Serialize(evnt) : null  }
+                   { GenAiEventContent, evnt  }
             };
 
             scope._activity?.AddEvent(
@@ -175,23 +178,29 @@ namespace Azure.AI.Agents.Persistent.Telemetry
                 return null;
             }
 
-            var createMessageRequest = DeserializeCreateMessageRequest(content);
-            object evnt = null;
+            CreateMessageRequest createMessageRequest = DeserializeCreateMessageRequest(content);
+            string evnt;
             if (s_traceContent)
             {
                 string message = createMessageRequest.Content.ToString().Trim('"');
-                evnt = new { content = message, role = createMessageRequest.Role.ToString() };
+                evnt = JsonSerializer.Serialize(
+                    new EventContentRole(content: message, role:createMessageRequest.Role.ToString()),
+                    EventsContext.Default.EventContentRole
+                );
             }
             else
             {
-                evnt = new { role = createMessageRequest.Role.ToString() };
+                evnt = JsonSerializer.Serialize(
+                    new EventRole(role: createMessageRequest.Role.ToString()),
+                    EventsContext.Default.EventRole
+                );
             }
 
             scope.SetTagMaybe(GenAiThreadIdKey, threadId);
             ActivityTagsCollection messageTags = new() {
                    { GenAiSystemKey, GenAiSystemValue},
                    { GenAiThreadIdKey, threadId},
-                   { GenAiEventContent, evnt != null ? JsonSerializer.Serialize(evnt) : null  }
+                   { GenAiEventContent, evnt }
             };
             scope._activity?.AddEvent(
                 new ActivityEvent(EventNameUserMessage, tags: messageTags)
@@ -601,20 +610,20 @@ namespace Azure.AI.Agents.Persistent.Telemetry
         private void RecordToolOutputEvent(ToolOutput toolOutput)
         {
             // Build the event body
-            var eventBody = s_traceContent
+            EventContentId eventBody = s_traceContent
                 ? new
-                {
-                    content = toolOutput.Output,
-                    id = toolOutput.ToolCallId
-                }
+                EventContentId(
+                    content: toolOutput.Output,
+                    id: toolOutput.ToolCallId
+                )
                 : new
-                {
-                    content = string.Empty,
-                    id = toolOutput.ToolCallId
-                };
+                EventContentId(
+                    content: string.Empty,
+                    id: toolOutput.ToolCallId
+                );
 
             // Serialize the event body
-            string serializedEventBody = JsonSerializer.Serialize(eventBody, s_jsonOptions);
+            string serializedEventBody = JsonSerializer.Serialize(eventBody, EventsContext.Default.EventContentId);
 
             // Build the attributes
             var attributes = new Dictionary<string, object>
@@ -908,14 +917,14 @@ namespace Azure.AI.Agents.Persistent.Telemetry
             };
 
             // Build the content body
-            Dictionary<string, object> contentBody = new();
+            Dictionary<string, Dictionary<string, string>> contentBody = new();
             if (s_traceContent && threadMessage.ContentItems != null)
             {
                 foreach (var content in threadMessage.ContentItems)
                 {
                     if (content is MessageTextContent textContent)
                     {
-                        var contentDetails = new Dictionary<string, object>
+                        var contentDetails = new Dictionary<string, string>
                         {
                             { "value", textContent.Text }
                         };
@@ -931,10 +940,12 @@ namespace Azure.AI.Agents.Persistent.Telemetry
             }
 
             // Build the event body
-            Dictionary<string, object> eventBody = new();
+            ThreadMessageEventAttributes eventBody = new(
+                role: threadMessage.Role.ToString()
+            );
             if (s_traceContent)
             {
-                eventBody["content"] = contentBody;
+                eventBody.content = contentBody;
             }
 
             if (threadMessage.Attachments != null && threadMessage.Attachments.Count > 0)
@@ -957,18 +968,15 @@ namespace Azure.AI.Agents.Persistent.Telemetry
                     attachmentList.Add(attachmentBody);
                 }
 
-                eventBody["attachments"] = attachmentList;
+                eventBody.attachments = attachmentList;
             }
 
             if (threadMessage.IncompleteDetails != null)
             {
-                eventBody["incomplete_details"] = threadMessage.IncompleteDetails;
+                eventBody.incomplete_details = threadMessage.IncompleteDetails;
             }
-
-            eventBody["role"] = threadMessage.Role.ToString();
-
             // Serialize the event body
-            string serializedEventBody = JsonSerializer.Serialize(eventBody, s_jsonOptions);
+            string serializedEventBody = JsonSerializer.Serialize(eventBody, EventsContext.Default.ThreadMessageEventAttributes);
 
             // Build the attributes
             Dictionary<string, object> attributes = new()
@@ -1084,7 +1092,9 @@ namespace Azure.AI.Agents.Persistent.Telemetry
                 var toolCalls = ProcessToolCalls(toolCallDetails);
                 if (toolCalls != null)
                 {
-                    attributes[GenAiEventContent] = JsonSerializer.Serialize(new { tool_calls = toolCalls }, s_jsonOptions);
+                    attributes[GenAiEventContent] = JsonSerializer.Serialize(
+                        new ToolCallAttribute(toolCalls),
+                        EventsContext.Default.ToolCallAttribute);
                 }
             }
 
@@ -1096,60 +1106,66 @@ namespace Azure.AI.Agents.Persistent.Telemetry
         /// Processes tool calls and returns a list of tool call details.
         /// </summary>
         /// <param name="toolCallDetails">The tool call details to process.</param>
-        /// <returns>A list of processed tool call details.</returns>
-        private List<Dictionary<string, object>> ProcessToolCalls(RunStepToolCallDetails toolCallDetails)
+        /// <returns>A serialized list of processed tool call details.</returns>
+        private List<BasicToolCallAttributes> ProcessToolCalls(RunStepToolCallDetails toolCallDetails)
         {
-            var toolCalls = new List<Dictionary<string, object>>();
+            var toolCalls = new List<BasicToolCallAttributes>();
             var outputList = new List<Dictionary<string, object>>(); // Collect outputs here
 
             foreach (var toolCall in toolCallDetails.ToolCalls)
             {
-                var toolCallAttributes = new Dictionary<string, object>
-                       {
-                           { "id", toolCall.Id },
-                           { "type", toolCall.Type }
-                       };
-
-                if (s_traceContent)
+                BasicToolCallAttributes toolCallObj;
+                if (!s_traceContent)
+                {
+                    toolCallObj = new BasicToolCallAttributes(
+                        id: toolCall.Id,
+                        type: toolCall.Type
+                    );
+                }
+                else
                 {
                     switch (toolCall)
                     {
                         case RunStepFunctionToolCall functionToolCall:
-                            toolCallAttributes["function"] = new
-                            {
-                                name = functionToolCall.Name,
-                                arguments = JsonSerializer.Deserialize<Dictionary<string, object>>(functionToolCall.Arguments)
-                            };
+                            toolCallObj = new FunctionToolCallEvent(
+                                id: toolCall.Id,
+                                type: toolCall.Type,
+                                function: new FunctionCall(
+                                    name: functionToolCall.Name,
+                                    arguments: JsonSerializer.Deserialize(functionToolCall.Arguments, jsonTypeInfo: EventsContext.Default.DictionaryStringFunctionArgument)
+                                    )
+                                );
                             break;
 
                         case RunStepCodeInterpreterToolCall codeInterpreterToolCall:
-                            foreach (var output in codeInterpreterToolCall.Outputs)
-                            {
-                                var outputDictionary = ConvertToDictionary(output);
-                                outputList.Add(outputDictionary); // Add output to the list
-                            }
-                            toolCallAttributes["code_interpreter"] = new
-                            {
-                                input = codeInterpreterToolCall.Input,
-                                outputs = outputList
-                            };
+                            toolCallObj = new CodeInterpreterCallEvent(
+                                id: toolCall.Id,
+                                type: toolCall.Type,
+                                input: codeInterpreterToolCall.Input,
+                                outputs: codeInterpreterToolCall.Outputs
+                                );
                             break;
 
                         case RunStepBingGroundingToolCall bingGroundingToolCall:
-                            toolCallAttributes[toolCall.Type] = bingGroundingToolCall.BingGrounding;
+                            toolCallObj = new GenericToolCallEvent(
+                                id: toolCall.Id,
+                                type: toolCall.Type,
+                                details: bingGroundingToolCall.BingGrounding
+                            );
                             break;
 
                         default:
-                            var toolCallAttributeDetails = GetToolCallAttributes(toolCall);
-                            if (toolCallAttributes != null)
-                            {
-                                toolCallAttributes[toolCall.Type] = toolCallAttributeDetails;
-                            }
+                            IReadOnlyDictionary<string, string> toolCallAttributeDetails = GetToolCallAttributes(toolCall);
+                            toolCallObj = new GenericToolCallEvent(
+                                id: toolCall.Id,
+                                type: toolCall.Type,
+                                details: toolCallAttributeDetails
+                            );
                             break;
                     }
                 }
 
-                toolCalls.Add(toolCallAttributes);
+                toolCalls.Add(toolCallObj);
             }
 
             return toolCalls;
@@ -1240,7 +1256,7 @@ namespace Azure.AI.Agents.Persistent.Telemetry
             }
 
             // Return null if the property is not found or is not of the expected type
-            return null;
+            return new Dictionary<string, string>();
         }
     }
 }
